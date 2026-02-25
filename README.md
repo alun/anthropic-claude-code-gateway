@@ -28,3 +28,7 @@ ANTHROPIC_BASE_URL=http://localhost:3000/v1
 ```
 
 The API key can be any value — authentication is handled by the gateway using your Claude credentials.
+
+## Fair use
+
+This tool is intended for personal use only. Please respect [Anthropic's Terms of Service](https://www.anthropic.com/legal/consumer-terms) and use your Claude credentials responsibly.
