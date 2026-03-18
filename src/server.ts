@@ -42,30 +42,72 @@ function convertTools(tools: any[]): Tool[] {
   }));
 }
 
-// Convert Anthropic message to pi-ai message
-function convertMessage(m: any): Message {
+// Convert Anthropic message to pi-ai message(s)
+// One Anthropic user message with multiple tool_results expands to multiple pi-ai messages
+function convertMessage(m: any): Message[] {
   if (m.role === "user") {
-    // Check for tool_result content
     if (Array.isArray(m.content)) {
-      const toolResult = m.content.find((c: any) => c.type === "tool_result");
-      if (toolResult) {
-        return {
+      const results: Message[] = [];
+      const toolResults = m.content.filter((c: any) => c.type === "tool_result");
+      const textBlocks = m.content.filter((c: any) => c.type === "text");
+
+      // Each tool_result becomes its own ToolResultMessage
+      for (const toolResult of toolResults) {
+        const resultContent = typeof toolResult.content === "string"
+          ? toolResult.content
+          : Array.isArray(toolResult.content)
+            ? toolResult.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n")
+            : JSON.stringify(toolResult.content);
+        results.push({
           role: "toolResult",
           toolCallId: toolResult.tool_use_id,
-          toolName: "", // Not provided in Anthropic format
-          content: [{ type: "text", text: typeof toolResult.content === "string" ? toolResult.content : JSON.stringify(toolResult.content) }],
+          toolName: "",
+          content: [{ type: "text", text: resultContent }],
           isError: toolResult.is_error ?? false,
           timestamp: Date.now(),
-        };
+        });
       }
+
+      // If there are text/image blocks (and no tool results), emit a user message
+      if (toolResults.length === 0) {
+        const imageBlocks = m.content.filter((c: any) => c.type === "image");
+        if (imageBlocks.length > 0) {
+          // Build mixed content array with text and images
+          const contentArray: any[] = [];
+          for (const block of m.content) {
+            if (block.type === "text") {
+              contentArray.push({ type: "text", text: block.text });
+            } else if (block.type === "image") {
+              contentArray.push({
+                type: "image",
+                data: block.source?.data ?? "",
+                mimeType: block.source?.media_type ?? "image/png",
+              });
+            }
+          }
+          if (contentArray.length > 0) {
+            results.push({
+              role: "user",
+              content: contentArray,
+              timestamp: Date.now(),
+            });
+          }
+        } else if (textBlocks.length > 0) {
+          results.push({
+            role: "user",
+            content: textBlocks.map((c: any) => c.text).join("\n"),
+            timestamp: Date.now(),
+          });
+        }
+      }
+
+      if (results.length > 0) return results;
     }
-    return {
+    return [{
       role: "user",
-      content: typeof m.content === "string"
-        ? m.content
-        : m.content?.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n") ?? "",
+      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
       timestamp: Date.now(),
-    };
+    }];
   }
 
   if (m.role === "assistant") {
@@ -84,7 +126,7 @@ function convertMessage(m: any): Message {
         }
       }
     }
-    return {
+    return [{
       role: "assistant",
       content,
       api: "anthropic-messages",
@@ -93,15 +135,15 @@ function convertMessage(m: any): Message {
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       stopReason: "stop",
       timestamp: Date.now(),
-    };
+    }];
   }
 
   // Fallback
-  return {
+  return [{
     role: "user",
     content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
     timestamp: Date.now(),
-  };
+  }];
 }
 
 // Convert pi-ai response content to Anthropic format
@@ -122,6 +164,16 @@ function convertResponseContent(content: any[]): any[] {
   });
 }
 
+const CORS_ORIGIN = "app://obsidian.md";
+
+function corsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": CORS_ORIGIN,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+  };
+}
+
 const token = getClaudeToken();
 console.log("Claude token loaded");
 
@@ -130,18 +182,28 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
 
+    // CORS preflight
+    if (req.method === "OPTIONS" && url.pathname === "/v1/messages") {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
     if (req.method === "POST" && url.pathname === "/v1/messages") {
       try {
         const body = await req.json();
         const streaming = body.stream === true;
         console.log(`[${new Date().toISOString()}] POST /v1/messages model=${body.model} messages=${body.messages?.length ?? 0} stream=${streaming}`);
         const modelId = MODEL_ALIASES[body.model] ?? body.model ?? "claude-sonnet-4-20250514";
-        const maxTokens = body.max_tokens ?? 1024;
+        const maxTokens = body.max_tokens ?? 16384;
         const messages = body.messages ?? [];
         const tools = body.tools ?? [];
+        const systemPrompt = typeof body.system === "string"
+          ? body.system
+          : Array.isArray(body.system)
+            ? body.system.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n")
+            : undefined;
 
-        // Convert to pi-ai format
-        const piMessages = messages.map(convertMessage);
+        // Convert to pi-ai format (one Anthropic message may expand to multiple pi-ai messages)
+        const piMessages = messages.flatMap(convertMessage);
         const piTools = tools.length > 0 ? convertTools(tools) : undefined;
 
         const model = getModel("anthropic", modelId);
@@ -155,7 +217,7 @@ Bun.serve({
 
         const response = await completeSimple(
           model,
-          { messages: piMessages, tools: piTools },
+          { systemPrompt, messages: piMessages, tools: piTools },
           { apiKey: token, maxTokens }
         );
 
@@ -188,7 +250,7 @@ Bun.serve({
             model: usedModel,
             stop_reason: stopReason,
             usage,
-          });
+          }, { headers: corsHeaders() });
         }
 
         // SSE streaming response
@@ -264,13 +326,14 @@ Bun.serve({
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
+            ...corsHeaders(),
           },
         });
       } catch (err: any) {
         console.error(err);
         return Response.json(
           { error: { type: "api_error", message: err.message } },
-          { status: 500 }
+          { status: 500, headers: corsHeaders() }
         );
       }
     }
